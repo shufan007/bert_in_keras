@@ -3,19 +3,24 @@
 # 比赛地址：https://tianchi.aliyun.com/competition/entrance/231716/introduction
 # 目前全匹配率大概是58%左右
 
+# 实测：2080ti-8G 运行时间43min，匹配率大概是50%左右
+
 import json
-import uniout
+#import uniout
 from keras_bert import load_trained_model_from_checkpoint, Tokenizer
 import codecs
-from keras.layers import *
-from keras.models import Model
-import keras.backend as K
-from keras.optimizers import Adam
-from keras.callbacks import Callback
+from tensorflow.keras.layers import *
+from tensorflow.keras.models import Model
+#import keras.backend as K
+import tensorflow.keras.backend as K
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import Callback
 from tqdm import tqdm
 import jieba
 import editdistance
 import re
+import numpy as np
+import os
 
 
 maxlen = 160
@@ -25,10 +30,10 @@ num_cond_conn_op = 3 # conn_sql_dict = {0:"", 1:"and", 2:"or"}
 learning_rate = 5e-5
 min_learning_rate = 1e-5
 
-
-config_path = '../../kg/bert/chinese_wwm_L-12_H-768_A-12/bert_config.json'
-checkpoint_path = '../../kg/bert/chinese_wwm_L-12_H-768_A-12/bert_model.ckpt'
-dict_path = '../../kg/bert/chinese_wwm_L-12_H-768_A-12/vocab.txt'
+bert_model_ch_path = '../bert_model/chinese_wwm_L-12_H-768_A-12'
+config_path = os.path.join(bert_model_ch_path, 'bert_config.json')
+checkpoint_path = os.path.join(bert_model_ch_path,'bert_model.ckpt')
+dict_path = os.path.join(bert_model_ch_path, 'vocab.txt')
 
 
 def read_data(data_file, table_file):
@@ -52,10 +57,11 @@ def read_data(data_file, table_file):
             tables[l['id']] = d
     return data, tables
 
-
-train_data, train_tables = read_data('../datasets/train.json', '../datasets/train.tables.json')
-valid_data, valid_tables = read_data('../datasets/val.json', '../datasets/val.tables.json')
-test_data, test_tables = read_data('../datasets/test.json', '../datasets/test.tables.json')
+import os
+data_path = '../datasets/nl2sql-TableQA-ch'
+train_data, train_tables = read_data(os.path.join(data_path, 'train/train.json'), os.path.join(data_path, 'train/train.tables.json'))
+valid_data, valid_tables = read_data(os.path.join(data_path, 'val/val.json'), os.path.join(data_path, 'val/val.tables.json'))
+test_data, test_tables = read_data(os.path.join(data_path, 'test/test.json'), os.path.join(data_path, 'test/test.tables.json'))
 
 
 token_dict = {}
@@ -65,7 +71,9 @@ with codecs.open(dict_path, 'r', 'utf8') as reader:
         token = line.strip()
         token_dict[token] = len(token_dict)
 
-
+"""
+注：调整 Tokenizer
+"""
 class OurTokenizer(Tokenizer):
     def _tokenize(self, text):
         R = []
@@ -113,7 +121,7 @@ def most_similar_2(w, s):
 
 
 class data_generator:
-    def __init__(self, data, tables, batch_size=32):
+    def __init__(self, data, tables, batch_size=8):
         self.data = data
         self.tables = tables
         self.batch_size = batch_size
@@ -124,7 +132,7 @@ class data_generator:
         return self.steps
     def __iter__(self):
         while True:
-            idxs = range(len(self.data))
+            idxs = list(range(len(self.data)))
             np.random.shuffle(idxs)
             X1, X2, XM, H, HM, SEL, CONN, CSEL, COP = [], [], [], [], [], [], [], [], []
             for i in idxs:
@@ -180,8 +188,7 @@ class data_generator:
                     COP = seq_padding(COP, maxlen=X1.shape[1])
                     yield [X1, X2, XM, H, HM, SEL, CONN, CSEL, COP], None
                     X1, X2, XM, H, HM, SEL, CONN, CSEL, COP = [], [], [], [], [], [], [], [], []
-
-
+                    
 def seq_gather(x):
     """seq是[None, seq_len, s_size]的格式，
     idxs是[None, n]的格式，在seq的第i个序列中选出第idxs[i]个向量，
@@ -189,7 +196,11 @@ def seq_gather(x):
     """
     seq, idxs = x
     idxs = K.cast(idxs, 'int32')
-    return K.tf.batch_gather(seq, idxs)
+    #return K.tf.batch_gather(seq, idxs) 
+    
+    # 原代码在高版本tf上运行报错，对gather做如下修改
+    return tf.gather(seq, idxs, axis=1, batch_dims=1)
+
 
 
 bert_model = load_trained_model_from_checkpoint(config_path, checkpoint_path, seq_len=None)
@@ -255,6 +266,8 @@ pcop_loss = K.sparse_categorical_crossentropy(cop_in, pcop)
 pcop_loss = K.sum(pcop_loss * xm) / K.sum(xm)
 pcsel_loss = K.sparse_categorical_crossentropy(csel_in, pcsel)
 pcsel_loss = K.sum(pcsel_loss * xm * cm) / K.sum(xm * cm)
+
+# 注：
 loss = psel_loss + pconn_loss + pcop_loss + pcsel_loss
 
 train_model.add_loss(loss)
@@ -336,6 +349,17 @@ def is_equal(R1, R2):
     (set([tuple(i) for i in R1['conds']]) == set([tuple(i) for i in R2['conds']]))
 
 
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)      
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return super(NpEncoder, self).default(obj)
+        
 def evaluate(data, tables):
     right = 0.
     pbar = tqdm()
@@ -348,8 +372,9 @@ def evaluate(data, tables):
         pbar.update(1)
         pbar.set_description('< acc: %.5f >' % (right / (i + 1)))
         d['sql_pred'] = R
-        s = json.dumps(d, ensure_ascii=False, indent=4)
-        F.write(s.encode('utf-8') + '\n')
+        s = json.dumps(d, ensure_ascii=False, indent=4, cls=NpEncoder)
+        #F.write(s.encode('utf-8') + '\n')
+        F.write(s + '\n')  # 取消编码，utf-8 编码运行报错
     F.close()
     pbar.close()
     return right / len(data)
@@ -364,7 +389,8 @@ def test(data, tables, outfile='result.json'):
         R = nl2sql(question, table)
         pbar.update(1)
         s = json.dumps(R, ensure_ascii=False)
-        F.write(s.encode('utf-8') + '\n')
+        #F.write(s.encode('utf-8') + '\n')
+        F.write(s + '\n')
     F.close()
     pbar.close()
 
@@ -395,20 +421,22 @@ class Evaluate(Callback):
         if acc > self.best:
             self.best = acc
             train_model.save_weights('best_model.weights')
-        print 'acc: %.5f, best acc: %.5f\n' % (acc, self.best)
+        print('acc: %.5f, best acc: %.5f\n' % (acc, self.best))
     def evaluate(self):
         return evaluate(valid_data, valid_tables)
 
 
 train_D = data_generator(train_data, train_tables)
+
+#train_D = data_generator(train_data[:20], train_tables) # 控制规模，做debug
 evaluator = Evaluate()
 
-if __name__ == '__main__':
-    train_model.fit_generator(
-        train_D.__iter__(),
-        steps_per_epoch=len(train_D),
-        epochs=15,
-        callbacks=[evaluator]
-    )
-else:
-    train_model.load_weights('best_model.weights')
+#%%time
+
+train_model.fit(
+    train_D.__iter__(),
+    steps_per_epoch=len(train_D),
+    epochs=2,
+    callbacks=[evaluator]
+)
+                    
