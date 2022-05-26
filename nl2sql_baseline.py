@@ -9,6 +9,7 @@ import json
 #import uniout
 from keras_bert import load_trained_model_from_checkpoint, Tokenizer
 import codecs
+import tensorflow as tf
 from tensorflow.keras.layers import *
 from tensorflow.keras.models import Model
 #import keras.backend as K
